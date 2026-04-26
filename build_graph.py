@@ -23,6 +23,7 @@ import json
 import re
 import shutil
 from collections import defaultdict
+from datetime import datetime
 from pathlib import Path
 from typing import Iterable
 
@@ -240,14 +241,38 @@ def find_neighbors(arts: list[Article], top_k: int, threshold: float):
 
 # ── Vault writer ────────────────────────────────────────────────────────────
 
+def humanize_delta(days: int) -> str:
+    """Render a signed day count as 'Nmo earlier' / '3wk later' / 'same day'."""
+    if days == 0:
+        return "same day"
+    suffix = "earlier" if days < 0 else "later"
+    n = abs(days)
+    if n < 7:
+        return f"{n}d {suffix}"
+    if n < 60:
+        return f"{n // 7}wk {suffix}"
+    if n < 365 * 2:
+        return f"{n // 30}mo {suffix}"
+    return f"{n // 365}y {suffix}"
+
+
 def render_related(this: Article, picks: list[tuple[str, float]],
                    by_id: dict[str, Article]) -> str:
     if not picks:
         return ""
+    this_when = parse_when(this)
     lines = [RELATED_MARK_BEGIN, "## Related", ""]
     for tid, score in picks:
         other = by_id[tid]
-        lines.append(f"- [[{other.slug}]] — {other.display_title()}  ·  ({score:.2f})")
+        other_when = parse_when(other)
+        if this_when != datetime.min and other_when != datetime.min:
+            delta_days = (other_when - this_when).days
+            time_str = humanize_delta(delta_days)
+        else:
+            time_str = "?"
+        lines.append(
+            f"- [[{other.slug}]] — {other.display_title()}  ·  {time_str}  ·  ({score:.2f})"
+        )
     lines.append(RELATED_MARK_END)
     return "\n".join(lines) + "\n"
 
@@ -265,9 +290,6 @@ def write_vault(arts: list[Article], neighbors) -> None:
         old = a.folder / "body.md"
         if old.exists() and old != target:
             old.unlink()
-
-
-from datetime import datetime
 
 
 def parse_when(a: Article) -> datetime:
