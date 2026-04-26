@@ -169,17 +169,6 @@ BOOKMARK_TOOLS = [
     list_bookmarks, show_bookmark, read_article, update_memory,
 ]
 SERVER = create_sdk_mcp_server(name="bookmarks", version="0.1.0", tools=BOOKMARK_TOOLS)
-TOOL_NAMES = [f"mcp__bookmarks__{t.__name__ if hasattr(t, '__name__') else n}"
-              for n, t in [
-                  ("search_bookmarks", search_bookmarks),
-                  ("get_stats", get_stats),
-                  ("list_categories", list_categories),
-                  ("list_bookmarks", list_bookmarks),
-                  ("show_bookmark", show_bookmark),
-                  ("read_article", read_article),
-                  ("update_memory", update_memory),
-              ]]
-# The decorator wraps; just hardcode the names to be safe.
 TOOL_NAMES = [
     "mcp__bookmarks__search_bookmarks",
     "mcp__bookmarks__get_stats",
@@ -226,9 +215,18 @@ def build_options(continue_conv: bool = True) -> ClaudeAgentOptions:
         system_prompt=build_system_prompt(),
         model=MODEL,
         mcp_servers={"bookmarks": SERVER},
+        # `tools` restricts what's advertised to the model; `allowed_tools` is the
+        # permission whitelist. Set both to our MCP tools so no built-in Claude
+        # Code tools (Bash, Edit, Write, Read) are ever in scope.
+        tools=TOOL_NAMES,
         allowed_tools=TOOL_NAMES,
+        # Don't load user/project/local settings — keep the agent self-contained.
+        setting_sources=[],
+        # Scope sessions to AGENT_DIR so continue_conversation doesn't collide
+        # with whatever Claude Code session might exist in the project dir.
+        cwd=str(AGENT_DIR),
         continue_conversation=continue_conv,
-        permission_mode="bypassPermissions",
+        permission_mode="default",
     )
 
 
@@ -271,7 +269,6 @@ async def repl() -> None:
     # First turn resumes prior session; subsequent turns share this client's context.
     options = build_options(continue_conv=True)
     async with ClaudeSDKClient(options=options) as client:
-        first = True
         while True:
             try:
                 question = await asyncio.to_thread(input, "> ")
@@ -285,7 +282,6 @@ async def repl() -> None:
             async for msg in client.receive_response():
                 render_message(msg)
             print()
-            first = False
 
 
 def main():
