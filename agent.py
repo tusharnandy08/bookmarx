@@ -124,10 +124,14 @@ def show_bookmark(tweet_id: str) -> str:
 
 
 def read_article(tweet_id: str) -> str:
-    path = os.path.join(ARTICLES_DIR, tweet_id, "body.md")
-    if not os.path.exists(path):
+    folder = os.path.join(ARTICLES_DIR, tweet_id)
+    if not os.path.isdir(folder):
         return f"No enriched article on disk for tweet {tweet_id}. (Either it has no link, the link was skipped, or enrichment failed.)"
-    with open(path) as f:
+    # File is either body.md (pre-vault) or <slug>.md (post-vault).
+    candidates = sorted(p for p in os.listdir(folder) if p.endswith(".md"))
+    if not candidates:
+        return f"No markdown body found in {folder}"
+    with open(os.path.join(folder, candidates[0])) as f:
         return f.read()
 
 
