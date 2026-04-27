@@ -357,6 +357,55 @@ def append_trace(row: dict) -> None:
         f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
 
+def write_sidecar(row: dict) -> None:
+    """For traced rows, write a markdown sidecar at videos/<tid>/source.md.
+    Mirrors the layout of articles/<tid>/<slug>.md so traced lectures are
+    browseable in Obsidian alongside articles. Idempotent rewrite."""
+    if row.get("status") != "traced":
+        return
+    tid = row["tweet_id"]
+    folder = VIDEOS_DIR / tid
+    folder.mkdir(parents=True, exist_ok=True)
+    duration_min = int((row.get("youtube_duration_sec") or 0) // 60)
+    extracted = row.get("extracted") or {}
+    fm_lines = ["---"]
+    for k, v in [
+        ("tweet_id", tid),
+        ("tweet_url", row.get("tweet_url")),
+        ("tweet_author_handle", row.get("tweet_author_handle")),
+        ("tweet_posted_at", row.get("tweet_posted_at")),
+        ("youtube_url", row.get("youtube_url")),
+        ("youtube_title", row.get("youtube_title")),
+        ("youtube_channel", row.get("youtube_channel")),
+        ("youtube_duration_minutes", duration_min),
+        ("confidence", row.get("confidence")),
+        ("speaker", extracted.get("speaker")),
+        ("topic", extracted.get("topic")),
+        ("traced_at", row.get("traced_at")),
+    ]:
+        if v is None:
+            continue
+        if isinstance(v, str) and any(c in v for c in ":#\n\"'") or (isinstance(v, str) and v.strip() != v):
+            v = json.dumps(v, ensure_ascii=False)
+        fm_lines.append(f"{k}: {v}")
+    fm_lines.append("---")
+    fm_lines.append("")
+    title = row.get("youtube_title") or "(untitled lecture)"
+    body = [
+        f"# {title}",
+        "",
+        f"[Watch on YouTube]({row.get('youtube_url')})  ·  {duration_min} min  ·  {row.get('youtube_channel','?')}",
+        "",
+        "## Tweet",
+        "",
+        "> " + (row.get("tweet_text") or "").replace("\n", "\n> "),
+        "",
+        f"[Original tweet]({row.get('tweet_url')})",
+        "",
+    ]
+    (folder / "source.md").write_text("\n".join(fm_lines) + "\n".join(body) + "\n")
+
+
 def rewrite_traces(rows_by_id: dict[str, dict]) -> None:
     """Used after --force re-traces; rewrite the file deduped by tweet_id."""
     tmp = TRACES_PATH.with_suffix(".jsonl.tmp")
@@ -421,6 +470,9 @@ def main():
         else:
             append_trace(row)
             cached[tid] = row
+
+        # Sidecar markdown so traced lectures live next to articles in Obsidian
+        write_sidecar(row)
 
         info = ""
         if status == "traced":

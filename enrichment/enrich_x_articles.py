@@ -6,7 +6,7 @@ render them to markdown alongside external articles.
 Articles are owned by tweets — the bookmark's tweet_id IS the tweet that owns
 the article. So we just call TweetResultByRestId(tweetId=<bookmark.id>).
 
-Auth: cookies extracted from the user's Comet profile via tools/x_cookies.mjs.
+Auth: cookies extracted from the user's Comet profile via ../tools/x_cookies.mjs.
 Same output layout as enrich_articles.py: ~/.ft-bookmarks/articles/<tweetId>/.
 """
 
@@ -90,7 +90,7 @@ FIELD_TOGGLES = {
 
 def get_cookies() -> dict:
     raw = subprocess.check_output(
-        ["node", str(Path(__file__).parent / "tools" / "x_cookies.mjs")],
+        ["node", str(Path(__file__).parent.parent / "tools" / "x_cookies.mjs")],
         stderr=subprocess.PIPE,
     )
     return json.loads(raw)
