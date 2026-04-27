@@ -5,3 +5,4 @@ trafilatura>=2.0
 requests>=2.31
 sentence-transformers>=3.0
 numpy>=1.26
+yt-dlp>=2025.1.1
