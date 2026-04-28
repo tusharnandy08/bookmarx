@@ -1,33 +1,47 @@
 #!/usr/bin/env python3
 """
 Bookmark agent — chat interface over your X bookmarks, built on the
-Claude Agent SDK (Anthropic's official agent harness — same engine as
-Claude Code, with built-in session resumption and tool dispatch).
+Claude Agent SDK with a context-engineering layer inspired by Xu et al.,
+"Everything is Context: Agentic File System Abstraction for Context
+Engineering" (arXiv:2512.05470, 2025).
+
+Memory layout (~/.ft-bookmarks/agent/):
+  history/<session-id>.jsonl      raw per-turn log (user, tool, assistant)
+  memory/
+    user.md                       WHO the user is, always in system prompt
+    facts.md                      atomic durable facts, always in system prompt
+    episodic/<session-id>.md      per-session summaries, lazy-loaded via recall()
+  scratchpad/current.md           transient task notes, cleared per session
+
+Across sessions: continue_conversation=True lets the SDK resume the prior
+session's full message history. Within-session compaction is handled by
+Claude Code itself. Long-term context flow is our concern: at session end,
+if the conversation crossed COMPRESSION_TURN_THRESHOLD turns, a Haiku
+summariser writes an episodic memory file that becomes searchable via
+the recall() tool from future sessions.
+
+Tools (4):
+  update_user(content)   replace user.md
+  update_facts(content)  replace facts.md
+  pin_fact(text)         append one bullet to facts.md
+  recall(query, limit)   grep facts.md + memory/episodic/*.md
 
 Usage:
-  python agent.py                    # interactive chat REPL
-  python agent.py "summarize the Ray Dalio piece"   # one-shot question
-
-Memory:
-  Within a session: full conversation context retained automatically.
-  Across sessions: continue_conversation=True resumes the previous
-    session, so the agent remembers prior turns even after you exit.
-  Long-term durable facts: ~/.ft-bookmarks/agent/memory.md, injected
-    into the system prompt every session. The agent can rewrite this
-    file via the update_memory tool when it learns durable facts about
-    you (preferences, environment, recurring decisions).
-
-Requirements: `claude` CLI installed and authenticated, ANTHROPIC_API_KEY
-in .env (or `claude login`).
+  python agent.py                    # interactive REPL
+  python agent.py "your question"    # one-shot
 """
 
 import asyncio
+import json
 import os
+import re
 import subprocess
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+import anthropic
 from dotenv import load_dotenv
 
 load_dotenv(override=True)
@@ -39,6 +53,7 @@ from claude_agent_sdk import (
     ResultMessage,
     TextBlock,
     ToolUseBlock,
+    UserMessage,
     create_sdk_mcp_server,
     tool,
 )
@@ -48,24 +63,103 @@ from claude_agent_sdk import (
 BOOKMARKS_PATH = Path.home() / ".ft-bookmarks" / "bookmarks.jsonl"
 ARTICLES_DIR = Path.home() / ".ft-bookmarks" / "articles"
 AGENT_DIR = Path.home() / ".ft-bookmarks" / "agent"
-MEMORY_PATH = AGENT_DIR / "memory.md"
+HISTORY_DIR = AGENT_DIR / "history"
+MEMORY_DIR = AGENT_DIR / "memory"
+EPISODIC_DIR = MEMORY_DIR / "episodic"
+SCRATCHPAD_DIR = AGENT_DIR / "scratchpad"
 
-AGENT_DIR.mkdir(parents=True, exist_ok=True)
-if not MEMORY_PATH.exists():
-    MEMORY_PATH.write_text(
-        "# Memory\n\n"
-        "Durable facts about the user, their environment, and recurring conventions.\n"
-        "Rewrite this file via update_memory when you learn something durable.\n"
-        "Skip task progress / session outcomes — those live in session history.\n\n"
-        "## Environment\n"
-        "- Bookmarks at ~/.ft-bookmarks/bookmarks.jsonl, synced via `ft sync` from Comet.\n"
-        "- Enriched articles at ~/.ft-bookmarks/articles/<tweetId>/<author-slug>.md, opened as an Obsidian vault.\n"
-        "- 207 articles enriched out of 217 link-bearing bookmarks.\n\n"
-        "## User\n"
-        "- (unknown — fill in as you learn)\n"
-    )
+USER_PATH = MEMORY_DIR / "user.md"
+FACTS_PATH = MEMORY_DIR / "facts.md"
+LEGACY_MEMORY_PATH = AGENT_DIR / "memory.md"
 
+USER_LIMIT = 1500    # chars
+FACTS_LIMIT = 3000   # chars
+COMPRESSION_TURN_THRESHOLD = 30
+SUMMARISER_MODEL = "claude-haiku-4-5"
 MODEL = "claude-sonnet-4-5"
+
+
+# ── First-run setup + migration ─────────────────────────────────────────────
+
+def _ensure_dirs() -> None:
+    for p in (HISTORY_DIR, MEMORY_DIR, EPISODIC_DIR, SCRATCHPAD_DIR):
+        p.mkdir(parents=True, exist_ok=True)
+
+
+def _migrate_legacy_memory() -> None:
+    """If memory/user.md and memory/facts.md don't exist, split the legacy
+    monolithic memory.md into them. Old file is preserved as memory.md.bak."""
+    if USER_PATH.exists() or FACTS_PATH.exists():
+        return
+    if not LEGACY_MEMORY_PATH.exists():
+        # Cold start — write minimal stubs.
+        USER_PATH.write_text(
+            "# user.md — who the user is\n\n"
+            "Identity, communication style, decisions about how to work together. "
+            f"Cap ~{USER_LIMIT} chars. Always loaded into the system prompt.\n\n"
+            "## Identity\n- (unknown — fill in via update_user as you learn)\n\n"
+            "## Working style\n- (unknown)\n"
+        )
+        FACTS_PATH.write_text(
+            "# facts.md — durable atomic facts\n\n"
+            f"Environment, data layout, conventions. Cap ~{FACTS_LIMIT} chars. "
+            "Pin via pin_fact (append) or rewrite via update_facts.\n\n"
+            "## Environment\n"
+            "- Bookmarks at ~/.ft-bookmarks/bookmarks.jsonl, synced via `ft sync` from Comet.\n"
+            "- Enriched articles at ~/.ft-bookmarks/articles/<tweetId>/<author-slug>.md.\n"
+            "- Traced video lectures at ~/.ft-bookmarks/videos/<tweetId>/source.md.\n"
+        )
+        return
+    text = LEGACY_MEMORY_PATH.read_text()
+    # Split on "## " sections; collect Environment → facts, User → user.
+    user_lines: list[str] = []
+    facts_lines: list[str] = []
+    current = None
+    for line in text.splitlines():
+        m = re.match(r"^##\s+(.+?)\s*$", line)
+        if m:
+            head = m.group(1).strip().lower()
+            if head == "user":
+                current = user_lines
+            elif head in ("environment", "conventions", "facts"):
+                current = facts_lines
+            else:
+                current = None
+            continue
+        if current is not None and line.strip():
+            current.append(line)
+    USER_PATH.write_text(
+        "# user.md\n\n## Identity\n" + "\n".join(user_lines).strip() + "\n"
+        if user_lines else "# user.md\n\n## Identity\n- (unknown)\n"
+    )
+    FACTS_PATH.write_text(
+        "# facts.md\n\n## Environment\n" + "\n".join(facts_lines).strip() + "\n"
+        if facts_lines else "# facts.md\n\n## Environment\n- (none yet)\n"
+    )
+    LEGACY_MEMORY_PATH.rename(LEGACY_MEMORY_PATH.with_suffix(".md.bak"))
+
+
+_ensure_dirs()
+_migrate_legacy_memory()
+
+# Per-process session id, used by tools and the REPL for history + summary file paths.
+SESSION_ID = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+
+
+# ── History log ─────────────────────────────────────────────────────────────
+
+def history_path() -> Path:
+    return HISTORY_DIR / f"{SESSION_ID}.jsonl"
+
+
+def log_event(role: str, content: Any) -> None:
+    rec = {
+        "ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "role": role,
+        "content": content,
+    }
+    with open(history_path(), "a") as f:
+        f.write(json.dumps(rec, ensure_ascii=False, default=str) + "\n")
 
 
 # ── Tool helpers ─────────────────────────────────────────────────────────────
@@ -140,35 +234,106 @@ async def read_article(args: dict[str, Any]) -> dict[str, Any]:
     return _text_result(candidates[0].read_text())
 
 
-# ── Memory tool ──────────────────────────────────────────────────────────────
+# ── Memory tools (4) ────────────────────────────────────────────────────────
 
-MEMORY_LIMIT = 4000  # chars
+@tool(
+    "update_user",
+    f"Rewrite the entire user.md file (cap {USER_LIMIT} chars). Pass the FULL new content. "
+    "Use for the user's identity, communication style, decisions about how to work together. "
+    "user.md is always loaded into the system prompt — keep it concise and high-signal.",
+    {"content": str},
+)
+async def update_user(args: dict[str, Any]) -> dict[str, Any]:
+    content = args["content"].rstrip() + "\n"
+    if len(content) > USER_LIMIT:
+        return _text_result(f"refused: {len(content)} > {USER_LIMIT} cap. Trim and retry.")
+    USER_PATH.write_text(content)
+    return _text_result(f"ok: wrote {len(content)} chars to user.md")
 
 
 @tool(
-    "update_memory",
-    f"Rewrite the entire memory file (cap {MEMORY_LIMIT} chars). Pass the FULL new content — "
-    "this is a replace, not append. Use for durable facts about the user, environment, "
-    "preferences, recurring conventions. Do NOT use for task progress or session outcomes.",
+    "update_facts",
+    f"Rewrite the entire facts.md file (cap {FACTS_LIMIT} chars). Pass the FULL new content. "
+    "Use for durable atomic facts about the user's environment, data layout, recurring "
+    "conventions. facts.md is always loaded into the system prompt — keep it dense.",
     {"content": str},
 )
-async def update_memory(args: dict[str, Any]) -> dict[str, Any]:
+async def update_facts(args: dict[str, Any]) -> dict[str, Any]:
     content = args["content"].rstrip() + "\n"
-    if len(content) > MEMORY_LIMIT:
-        return _text_result(
-            f"refused: {len(content)} chars exceeds limit of {MEMORY_LIMIT}. Trim and retry."
-        )
-    MEMORY_PATH.write_text(content)
-    return _text_result(f"ok: wrote {len(content)} chars to memory.md")
+    if len(content) > FACTS_LIMIT:
+        return _text_result(f"refused: {len(content)} > {FACTS_LIMIT} cap. Trim and retry.")
+    FACTS_PATH.write_text(content)
+    return _text_result(f"ok: wrote {len(content)} chars to facts.md")
+
+
+@tool(
+    "pin_fact",
+    "Append a single one-line bullet to facts.md. Cheaper than update_facts when you "
+    "want to add one fact without rewriting the whole file. Refuses if facts.md would "
+    f"exceed {FACTS_LIMIT} chars after append.",
+    {"text": str},
+)
+async def pin_fact(args: dict[str, Any]) -> dict[str, Any]:
+    line = args["text"].strip()
+    if not line:
+        return _text_result("refused: empty fact")
+    bullet = f"- {line}\n"
+    current = FACTS_PATH.read_text() if FACTS_PATH.exists() else ""
+    if len(current) + len(bullet) > FACTS_LIMIT:
+        return _text_result(f"refused: would exceed {FACTS_LIMIT} char cap. Use update_facts to consolidate.")
+    with open(FACTS_PATH, "a") as f:
+        f.write(bullet)
+    return _text_result(f"ok: pinned ({len(current) + len(bullet)} chars total)")
+
+
+@tool(
+    "recall",
+    "Search past episodic session summaries and facts.md for relevant context. "
+    "Use when the user references something from a prior session ('remember when…', "
+    "'what did we decide about X'). Returns matching snippets with source file.",
+    {"query": str, "limit": int},
+)
+async def recall(args: dict[str, Any]) -> dict[str, Any]:
+    query = (args.get("query") or "").strip().lower()
+    limit = int(args.get("limit") or 5)
+    if not query:
+        return _text_result("empty query")
+    terms = [t for t in re.split(r"\W+", query) if len(t) >= 3]
+    if not terms:
+        return _text_result("query too short (need a 3+ char term)")
+
+    hits: list[tuple[str, str, int]] = []  # (source, snippet, score)
+    sources = list(EPISODIC_DIR.glob("*.md"))
+    if FACTS_PATH.exists():
+        sources.append(FACTS_PATH)
+    for path in sources:
+        try:
+            text = path.read_text()
+        except OSError:
+            continue
+        # paragraph-level scoring: count term occurrences
+        for chunk in re.split(r"\n\s*\n", text):
+            chunk_l = chunk.lower()
+            score = sum(chunk_l.count(t) for t in terms)
+            if score == 0:
+                continue
+            label = path.relative_to(AGENT_DIR).as_posix()
+            snippet = chunk if len(chunk) <= 600 else chunk[:600] + "…"
+            hits.append((label, snippet, score))
+    hits.sort(key=lambda x: -x[2])
+    if not hits:
+        return _text_result(f"no matches for {query!r}")
+    out = [f"=== {label} (score {score}) ===\n{snippet}" for label, snippet, score in hits[:limit]]
+    return _text_result("\n\n".join(out))
 
 
 # ── Server bundle ────────────────────────────────────────────────────────────
 
 BOOKMARK_TOOLS = [
-    search_bookmarks, get_stats, list_categories,
-    list_bookmarks, show_bookmark, read_article, update_memory,
+    search_bookmarks, get_stats, list_categories, list_bookmarks, show_bookmark, read_article,
+    update_user, update_facts, pin_fact, recall,
 ]
-SERVER = create_sdk_mcp_server(name="bookmarks", version="0.1.0", tools=BOOKMARK_TOOLS)
+SERVER = create_sdk_mcp_server(name="bookmarks", version="0.2.0", tools=BOOKMARK_TOOLS)
 TOOL_NAMES = [
     "mcp__bookmarks__search_bookmarks",
     "mcp__bookmarks__get_stats",
@@ -176,7 +341,10 @@ TOOL_NAMES = [
     "mcp__bookmarks__list_bookmarks",
     "mcp__bookmarks__show_bookmark",
     "mcp__bookmarks__read_article",
-    "mcp__bookmarks__update_memory",
+    "mcp__bookmarks__update_user",
+    "mcp__bookmarks__update_facts",
+    "mcp__bookmarks__pin_fact",
+    "mcp__bookmarks__recall",
 ]
 
 
@@ -185,29 +353,40 @@ TOOL_NAMES = [
 INSTRUCTIONS = """You are a personal knowledge assistant over a curated collection of X (Twitter) bookmarks.
 
 The user has bookmarked tweets they found valuable. Many bookmarks point at long-form articles
-(X-native or external blogs); their full bodies are pre-fetched to disk and accessible via
-the read_article tool.
+(X-native or external blogs); their full bodies are pre-fetched to disk and accessible via the
+read_article tool.
 
-You have memory:
-- Persistent durable facts live in memory.md (shown below). Always loaded into your prompt.
-- When you learn a durable fact about the user (preferences, working style, environment),
-  call update_memory with the FULL new file content. Replace, don't append in your head —
-  re-write the whole file thoughtfully.
-- Within-session and cross-session conversation history is retained automatically by the
-  harness; you don't need a search tool for that.
+You have a tiered persistent memory:
+- user.md (below) — WHO the user is. Always loaded.
+- facts.md (below) — durable atomic facts. Always loaded.
+- episodic memory — per-session summaries, lazy-loaded via the recall() tool.
+- conversation history — managed by the harness (within and across sessions).
 
-Guidelines:
-- For "find me a tweet about X" — search_bookmarks, return the most relevant with the URL.
-- For "summarize / explain / what does X say" — read_article on the relevant tweet_id.
-- For "do we have anything on Y" — search and give a direct yes/no with examples.
-- Always include the tweet URL so the user can open it.
+When you learn something durable about the user, decide which file:
+- Identity / communication style / working agreements → update_user (full rewrite)
+- Environment / data layout / one-off facts → pin_fact (append) or update_facts (rewrite to consolidate)
+NEVER write task progress, partial todos, or session outcomes to memory — those go to history automatically.
+
+When the user references something from a prior session ("remember when…", "what did we say about X"),
+call recall() before answering.
+
+Bookmark tasks:
+- "find me a tweet about X" → search_bookmarks, return the most relevant + URL.
+- "summarize / explain / what does X say" → read_article on the relevant tweet_id.
+- "do we have anything on Y" → search and give a direct yes/no with examples.
+- Always include the tweet URL.
 - Be concise. One good result beats ten mediocre ones.
 """
 
 
 def build_system_prompt() -> str:
-    memory = MEMORY_PATH.read_text() if MEMORY_PATH.exists() else "(empty)"
-    return f"{INSTRUCTIONS}\n\n=== memory.md ===\n{memory}"
+    user_md = USER_PATH.read_text() if USER_PATH.exists() else "(empty)"
+    facts_md = FACTS_PATH.read_text() if FACTS_PATH.exists() else "(empty)"
+    return (
+        f"{INSTRUCTIONS}\n\n"
+        f"=== user.md ===\n{user_md}\n\n"
+        f"=== facts.md ===\n{facts_md}"
+    )
 
 
 def build_options(continue_conv: bool = True) -> ClaudeAgentOptions:
@@ -215,32 +394,38 @@ def build_options(continue_conv: bool = True) -> ClaudeAgentOptions:
         system_prompt=build_system_prompt(),
         model=MODEL,
         mcp_servers={"bookmarks": SERVER},
-        # `tools` restricts what's advertised to the model; `allowed_tools` is the
-        # permission whitelist. Set both to our MCP tools so no built-in Claude
-        # Code tools (Bash, Edit, Write, Read) are ever in scope.
         tools=TOOL_NAMES,
         allowed_tools=TOOL_NAMES,
-        # Don't load user/project/local settings — keep the agent self-contained.
         setting_sources=[],
-        # Scope sessions to AGENT_DIR so continue_conversation doesn't collide
-        # with whatever Claude Code session might exist in the project dir.
         cwd=str(AGENT_DIR),
         continue_conversation=continue_conv,
         permission_mode="default",
     )
 
 
-# ── Render assistant messages ────────────────────────────────────────────────
+# ── Render + log assistant messages ──────────────────────────────────────────
 
 def render_message(msg) -> None:
     if isinstance(msg, AssistantMessage):
         for block in msg.content:
             if isinstance(block, TextBlock):
                 print(block.text)
+                log_event("assistant", block.text)
             elif isinstance(block, ToolUseBlock):
-                # Show a compact trace so the user sees what's being called
                 short = block.name.replace("mcp__bookmarks__", "")
                 print(f"\033[2m[→ {short}({_short_args(block.input)})]\033[0m")
+                log_event("tool_use", {"name": short, "input": dict(block.input)})
+    elif isinstance(msg, UserMessage):
+        # tool_result blocks come back wrapped in a UserMessage
+        for block in msg.content:
+            if hasattr(block, "type") and block.type == "tool_result":
+                content = getattr(block, "content", "")
+                # content may be a list of blocks or a string
+                if isinstance(content, list):
+                    text = "".join(b.get("text", "") if isinstance(b, dict) else str(b) for b in content)
+                else:
+                    text = str(content)
+                log_event("tool_result", {"id": getattr(block, "tool_use_id", ""), "content": text[:2000]})
 
 
 def _short_args(args: dict) -> str:
@@ -253,20 +438,97 @@ def _short_args(args: dict) -> str:
     return ", ".join(parts)
 
 
+# ── Session-end summariser ──────────────────────────────────────────────────
+
+SUMMARY_PROMPT = """You are summarising a finished agent session for long-term memory.
+
+Read the transcript below (raw turn log: user prompts, tool calls + results, assistant text) and produce a tight episodic summary that a future session of the same agent could use to recall what happened.
+
+Rules:
+- 8–15 bullets max. Dense, no fluff.
+- Cover: what the user wanted, what was found/done, key facts uncovered, decisions made, open questions.
+- Quote tweet URLs / article slugs / file paths verbatim when they're load-bearing.
+- Skip mechanical detail (which tool fired when) unless it's a finding.
+- Speak in past tense, third person ("user asked X, agent answered Y").
+
+Transcript:
+{transcript}
+
+Output the summary as plain markdown. No preamble.
+"""
+
+
+def _read_history(session_id: str, max_chars: int = 60000) -> tuple[str, int]:
+    """Returns (transcript_text, turn_count). Truncates if too large."""
+    path = HISTORY_DIR / f"{session_id}.jsonl"
+    if not path.exists():
+        return "", 0
+    rows = []
+    turns = 0
+    with open(path) as f:
+        for line in f:
+            try:
+                rows.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+    for r in rows:
+        if r.get("role") == "user":
+            turns += 1
+    pieces = []
+    for r in rows:
+        role = r.get("role", "?")
+        content = r.get("content", "")
+        if isinstance(content, dict):
+            content = json.dumps(content, ensure_ascii=False)
+        pieces.append(f"[{r.get('ts','')}] {role}: {content}")
+    transcript = "\n".join(pieces)
+    if len(transcript) > max_chars:
+        transcript = transcript[-max_chars:]
+        transcript = "[... earlier turns truncated ...]\n" + transcript
+    return transcript, turns
+
+
+def maybe_summarise_session() -> None:
+    transcript, turns = _read_history(SESSION_ID)
+    if turns < COMPRESSION_TURN_THRESHOLD:
+        return
+    if not transcript:
+        return
+    print(f"\033[2m[compressing {turns} turns into episodic memory…]\033[0m")
+    client = anthropic.Anthropic()
+    try:
+        resp = client.messages.create(
+            model=SUMMARISER_MODEL,
+            max_tokens=1500,
+            messages=[{"role": "user", "content": SUMMARY_PROMPT.format(transcript=transcript)}],
+        )
+        body = "".join(b.text for b in resp.content if hasattr(b, "text"))
+    except Exception as e:
+        print(f"\033[2m[summariser failed: {e}]\033[0m")
+        return
+    out = EPISODIC_DIR / f"{SESSION_ID}.md"
+    fm = (
+        f"---\nsession_id: {SESSION_ID}\nturn_count: {turns}\n"
+        f"summarised_at: {datetime.now(timezone.utc).isoformat(timespec='seconds')}\n---\n\n"
+    )
+    out.write_text(fm + body.strip() + "\n")
+    print(f"\033[2m[wrote {out.relative_to(AGENT_DIR)}]\033[0m")
+
+
 # ── Modes ────────────────────────────────────────────────────────────────────
 
 async def one_shot(question: str) -> None:
+    log_event("user", question)
     options = build_options(continue_conv=True)
     async with ClaudeSDKClient(options=options) as client:
         await client.query(question)
         async for msg in client.receive_response():
             render_message(msg)
+    maybe_summarise_session()
 
 
 async def repl() -> None:
-    print("Bookmark agent ready (Claude Agent SDK). Memory + cross-session continuation on.")
-    print("Ctrl+C to quit.\n")
-    # First turn resumes prior session; subsequent turns share this client's context.
+    print(f"Bookmark agent ready. Session {SESSION_ID}. Ctrl+C to quit.\n")
     options = build_options(continue_conv=True)
     async with ClaudeSDKClient(options=options) as client:
         while True:
@@ -274,14 +536,16 @@ async def repl() -> None:
                 question = await asyncio.to_thread(input, "> ")
             except (KeyboardInterrupt, EOFError):
                 print()
-                return
+                break
             question = question.strip()
             if not question:
                 continue
+            log_event("user", question)
             await client.query(question)
             async for msg in client.receive_response():
                 render_message(msg)
             print()
+    maybe_summarise_session()
 
 
 def main():
