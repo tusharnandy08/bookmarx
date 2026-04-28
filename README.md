@@ -41,7 +41,12 @@ Data lives outside the repo, in ft's standard data dir:
 │   ├── traces.jsonl                    # one row per attempted bookmark, every status
 │   └── <tweetId>/source.md             # sidecar for traced lectures
 └── agent/
-    └── memory.md                       # durable facts, auto-injected into the agent's prompt
+    ├── history/<sessionId>.jsonl       # raw turn log per agent invocation
+    ├── memory/
+    │   ├── user.md                     # WHO (always in system prompt)
+    │   ├── facts.md                    # durable facts (always in system prompt)
+    │   └── episodic/<sessionId>.md     # session summaries (lazy via recall tool)
+    └── scratchpad/                     # transient task notes
 ```
 
 ## Install
@@ -110,7 +115,15 @@ Common flags across enrichers: `--tweet-id <id>` (one bookmark), `--limit N`, `-
 .venv/bin/python chat/agent.py "your question"    # one-shot
 ```
 
-The agent has tools for `search_bookmarks`, `read_article`, `update_memory`, etc. It uses `continue_conversation=True` so each invocation resumes the prior session. Durable facts go to `~/.ft-bookmarks/agent/memory.md`.
+Tools: `search_bookmarks`, `read_article`, `show_bookmark`, `list_bookmarks`, `get_stats`, `list_categories`, plus four memory tools — `update_user`, `update_facts`, `pin_fact`, `recall`.
+
+Memory is tiered (inspired by Xu et al., [arXiv:2512.05470](https://arxiv.org/abs/2512.05470)):
+
+- **Always in the system prompt:** `memory/user.md` (who you are) and `memory/facts.md` (durable atomic facts).
+- **Lazy via `recall(query)`:** `memory/episodic/<sessionId>.md` — per-session summaries written by a Haiku call when a session ends with more than 30 user turns.
+- **Raw log:** every prompt, tool call, tool result, and assistant text block lands in `history/<sessionId>.jsonl`.
+
+`continue_conversation=True` keeps the SDK's within-session message history across invocations; the tiered memory is what survives compactions and resets.
 
 ## Known gotchas
 
@@ -118,7 +131,8 @@ The agent has tools for `search_bookmarks`, `read_article`, `update_memory`, etc
 - **X GraphQL hash rotation.** The `TWEET_QUERY_HASH` constant in `enrichment/enrich_x_articles.py` is a captured hash. X rotates these every few weeks. When article fetches start failing, re-run `tools/probe_x_article.py` to capture a fresh hash and update the constant.
 - **`tools/probe_x_article.py` requires Playwright + Chromium** (`.venv/bin/playwright install chromium`) — only needed when refreshing the GraphQL hash.
 - **Cookie bridge requires Comet to be installed** with an active X login. To switch browsers, edit the `browserId` arg in `tools/x_cookies.mjs`.
-- **Memory file at `~/.ft-bookmarks/agent/memory.md`** is auto-injected into every agent session. Edit it by hand to seed facts; the agent rewrites it via `update_memory` when it learns something new.
+- **Memory files at `~/.ft-bookmarks/agent/memory/{user,facts}.md`** are always injected into the agent's system prompt. Edit them by hand to seed; the agent rewrites them via `update_user` / `update_facts` / `pin_fact` when it learns something durable. Episodic session summaries are written automatically when a session crosses 30 turns; tune `COMPRESSION_TURN_THRESHOLD` in `chat/agent.py` if needed.
+- **Legacy `memory.md` migration** runs once on first startup of the new agent — sections under `## User` move to `user.md`, `## Environment` / `## Conventions` / `## Facts` move to `facts.md`, and the old file is renamed to `memory.md.bak`.
 
 ## What's where
 
@@ -127,7 +141,8 @@ The agent has tools for `search_bookmarks`, `read_article`, `update_memory`, etc
 | Fetch new bookmarks | `ft sync` (or `sync_all.py`) |
 | Add a new enrichment kind | new script in `enrichment/`, add to `STAGES` in `sync_all.py` |
 | Change the agent's tools | `chat/agent.py` — `@tool` decorators on the bookmark functions |
-| Edit the agent's persistent memory | `~/.ft-bookmarks/agent/memory.md` |
+| Edit the agent's persistent memory | `~/.ft-bookmarks/agent/memory/user.md` and `facts.md` |
+| See what was said in a past session | `~/.ft-bookmarks/agent/history/<sessionId>.jsonl` (raw) or `memory/episodic/<sessionId>.md` (summary) |
 | Re-render the Obsidian graph | `python sync_all.py --only graph` |
 | Refresh the X auth cookies | edit `tools/x_cookies.mjs` (browserId), or run `node tools/x_cookies.mjs` |
 | Update the X GraphQL hash | `python tools/probe_x_article.py`, then edit `enrichment/enrich_x_articles.py:TWEET_QUERY_HASH` |
