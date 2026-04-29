@@ -26,7 +26,7 @@ ROOT = Path(__file__).resolve().parent
 PYTHON = sys.executable  # .venv/bin/python when invoked from venv
 
 STAGES = {
-    "sync": ["ft", "sync"],
+    "sync": ["ft", "sync", "--browser", "comet"],
     "articles": [PYTHON, str(ROOT / "enrichment" / "enrich_articles.py")],
     "x-articles": [PYTHON, str(ROOT / "enrichment" / "enrich_x_articles.py")],
     "videos": [PYTHON, str(ROOT / "enrichment" / "enrich_videos.py")],
