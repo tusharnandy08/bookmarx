@@ -130,7 +130,7 @@ Memory is tiered (inspired by Xu et al., [arXiv:2512.05470](https://arxiv.org/ab
 - **`ft` skips X URLs** in its own article enricher (`bookmark-enrich.js`). That's why this repo's `enrich_x_articles.py` exists — it routes around that limit using authenticated GraphQL.
 - **X GraphQL hash rotation.** The `TWEET_QUERY_HASH` constant in `enrichment/enrich_x_articles.py` is a captured hash. X rotates these every few weeks. When article fetches start failing, re-run `tools/probe_x_article.py` to capture a fresh hash and update the constant.
 - **`tools/probe_x_article.py` requires Playwright + Chromium** (`.venv/bin/playwright install chromium`) — only needed when refreshing the GraphQL hash.
-- **Cookie bridge requires Comet to be installed** with an active X login. To switch browsers, edit the `browserId` arg in `tools/x_cookies.mjs`.
+- **Cookie bridge requires Comet to be installed** with an active X login. To switch browsers, edit the `browserId` arg in `tools/x_cookies.mjs` *and* the hardcoded `--browser comet` in `sync_all.py`'s `STAGES["sync"]`.
 - **Memory files at `~/.ft-bookmarks/agent/memory/{user,facts}.md`** are always injected into the agent's system prompt. Edit them by hand to seed; the agent rewrites them via `update_user` / `update_facts` / `pin_fact` when it learns something durable. Episodic session summaries are written automatically when a session crosses 30 turns; tune `COMPRESSION_TURN_THRESHOLD` in `chat/agent.py` if needed.
 - **Legacy `memory.md` migration** runs once on first startup of the new agent — sections under `## User` move to `user.md`, `## Environment` / `## Conventions` / `## Facts` move to `facts.md`, and the old file is renamed to `memory.md.bak`.
 
