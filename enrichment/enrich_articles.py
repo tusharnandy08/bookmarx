@@ -180,13 +180,15 @@ def process_bookmark(b: dict, force: bool, only_kind: str | None):
 
     tweet_id = b["id"]
     out_dir = ARTICLES_DIR / tweet_id
-    body_path = out_dir / "body.md"
 
     if kind == "skip":
         return ("skip", normalize_host(url), url)
     if kind == "x_article":
         return ("deferred", "phase 2", url)
-    if body_path.exists() and not force:
+    # Cached if any *.md exists in the folder. body.md gets renamed to
+    # <author-slug>.md by build_graph; checking only body.md would re-fetch
+    # every previously-enriched article on each sync cycle.
+    if not force and out_dir.is_dir() and any(out_dir.glob("*.md")):
         return ("cached", "exists", url)
 
     try:
